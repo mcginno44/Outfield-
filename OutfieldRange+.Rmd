@@ -1,0 +1,123 @@
+---
+title: "mlbdatawork"
+author: "Owen McGinnis"
+date: "2026-03-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Note: Just for 2025
+```{r}
+library(dplyr)
+library(stringr)
+
+leftfielders = read.csv("/Users/omcginnis/Downloads/leftfield.csv")
+centerfielders = read.csv("/Users/omcginnis/Downloads/centerfield.csv")
+rightfielders = read.csv("/Users/omcginnis/Downloads/rightfield.csv")
+outfields = read.csv("/Users/omcginnis/Downloads/outfieldsreal.csv")
+outfielder_pattern <- "Right Fielder|Center Fielder|Left Fielder"
+all_outfielders = rbind(leftfielders,centerfielders,rightfielders)
+
+df_outfielders <- outfields[grepl(outfielder_pattern, outfields$des, ignore.case = TRUE), ]
+
+position_map <- c("7" = "LF","8" = "CF", "9" = "RF")
+
+df_outfielders$position <- position_map[as.character(df_outfielders$hit_location)]
+
+df_outfielders = df_outfielders |>
+  mutate(fielder = str_extract(des,"(?<=fielder).*?(?=\\.)")) |>
+  select(fielder,position,hc_x,hc_y,hit_distance_sc,launch_speed,launch_angle, plate_z) 
+
+all_outfielders$fielder = sub("^(.*),\\s*(.*)$", "\\2 \\1", all_outfielders$name_fielder)
+df_outfielders <- df_outfielders |>
+  mutate(fielder = str_trim(str_to_title(fielder)))
+all_outfielders <- all_outfielders |>
+  mutate(fielder = str_trim(str_to_title(fielder)))
+
+
+final_stats = inner_join(df_outfielders, all_outfielders, by = c("fielder","position"), relationship = "many-to-many")
+final_stats$hc_x = 2.5 * (final_stats$hc_x - 125.42)
+final_stats$hc_y = 2.5 * (198.27- final_stats$hc_y)
+angle_radians = final_stats$avg_norm_start_angle * pi / 180
+final_stats$field_x = sin(angle_radians) * final_stats$avg_norm_start_distance
+final_stats$field_y = cos(angle_radians) * final_stats$avg_norm_start_distance
+final_stats$distance = sqrt(((final_stats$field_x - final_stats$hc_x)^2) + ((final_stats$field_y-final_stats$hc_y)^2))
+final_stats = na.omit(final_stats)
+```
+
+This part is purely cleaning and preparing the data for analysis. Steps include providing for baseball position notation(outfield being 7,8,9), gleaning the name of the player that made the play using regex, and joining the sets of left, right and center fielders together to form one big outfielder set. Next, I devised my coordinate system for fielders with some trigonometry based off the average starting position data from Baseball Savant. I then had to adjust hit coordinates accordingly to fit on the same x-y plane as the fielder coordinates. The coordinates play a big role in determining hangtime(of the ball), the average speed required(of the outfielder) to make the play, and the distance traveled for each play(from the average starting spot of the fielder to landing spot of the ball). 
+
+```{r}
+head(final_stats)
+```
+
+Each row represents 1 of 18,126 plays in the Baseball Savant database that resulted in an out recorded by an outfielder. Variables I opted to keep include: player name, position(LF,CF,RF), hit coordinates(x and y), launch speed and angle(off the bat), height above the ground at which the ball was contacted(for hangtime calculation), team, year, average starting distance from home plate, average starting angle(0 being center field, 45 being the first base line, -45 being the third base line), the coordinates for the starting point(x and y), and the distance required to be traveled for the play.
+
+```{r}
+## hangtime calculation using hangtime formula
+velocity = final_stats$launch_speed * 1.46667 ## mph to feet per second
+theta = final_stats$launch_angle * pi/180 ## launch angle in radians
+final_stats$hangtime_sec <- (velocity * sin(theta) + sqrt((velocity * sin(theta))^2 + 2 * 21.94 * final_stats$plate_z)) / 21.94 ## hangtime formula
+final_stats$avg_speed_mph  = (final_stats$distance / final_stats$hangtime_sec) * 0.681818 ## feet per second back to mph(per d = rt)
+```
+
+
+
+```{r}
+## creating deployment column
+final_stats = final_stats |>
+  group_by(fld_name_display_club) |>
+  mutate(total_plays_team = n()) |>
+  ungroup() |>
+  group_by(fld_name_display_club, fielder) |>
+  mutate(deployment = n()/total_plays_team) |> ## essentially how much of a factor was the player(high factor, low performance = bad, low factor, high performance = bad, high factor, high performance = good, low factor, low performance = bad)
+  ungroup()
+  
+```
+
+## Final Data Set Creation and Visualization
+```{r}
+summary = final_stats |>
+  group_by(fielder) |>
+  mutate(range = (1/n() * (sum((avg_speed_mph * 1.467) * (hangtime_sec - 0.3)))), metric = sqrt(deployment * range)) |> ## range metric creation
+  summarise(effective_range = mean(range), metric = mean(metric), field_x = mean(field_x), field_y = mean(field_y), n = n()) |>
+  arrange(desc(metric)) |>
+  mutate(metric_plus = scale(metric))
+metric_table = summary |>
+  select(fielder, metric, metric_plus, effective_range, n)
+```
+
+$$ Player Range = \frac{1}{n} \sum_{i=1}^{n}([Play Average Speed (mph)*1.467]*[Hangtime(sec) - Reaction Time]) $$
+
+$$ Player Range Score = \sqrt{Deployment * Player Range}$$
+
+Square root to normalize the skew
+$$ Player Range+ = \frac{Player Range Score - \mu_{Player Range Score}}{\sigma_{Player Range Score}}$$
+
+This standardization makes league average 0
+
+```{r}
+library(sportyR)
+library(ggforce)
+circle_points <- summary |>
+  rowwise() |> 
+  reframe(fielder = fielder, hover = paste("Effective Range:", round(effective_range,3),"Feet <br> Outfield+: ", round(metric,3)), x = field_x + effective_range * cos(seq(0, 2*pi, length.out = 100)), y = field_y + effective_range * sin(seq(0, 2*pi, length.out = 100)))
+
+plot =  geom_baseball(league = "mlb", display_range = "infield") + geom_point(data = summary, aes(x = field_x, y = field_y, group = fielder, color = fielder)) + geom_polygon(data = circle_points, aes(x = x, y = y, group = fielder,fill = fielder,text = hover), alpha = 0.3,color = "black") + theme_minimal() + coord_fixed()
+
+plotly::ggplotly(plot)
+knitr::kable(metric_table)
+```
+
+
+```{r}
+hist(summary$metric, breaks = 10)
+abline(v = mean(summary$metric), col = "red")
+```
+
+Now, we have a metric, we'll call it Outfield Range+, that determines how good a player is in the outfield defensively and can be compared to others
+
+
